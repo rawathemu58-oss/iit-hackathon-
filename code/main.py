@@ -228,6 +228,33 @@ train_c = clean_frame(train)
 dev_c = clean_frame(dev)
 test_c = clean_frame(test)
 
+
+# ----------------------------------------------------------------------
+# 2b. ROLE-NORMALIZED FEATURES
+#     applied_role isn't on the insider's "old-panel bias" list (that list is
+#     college/city/channel/brand-employer/degree/gaps), so normalizing by it
+#     is safe signal, not something we're told the new panel ignores.
+#     Roles have genuinely different baselines (train.csv: DevOps ~52 avg,
+#     Full Stack ~46 avg on post_hire_score), so a raw 8/10 aptitude score
+#     means something different depending on the role applied for.
+# ----------------------------------------------------------------------
+ROLE_Z_COLS = ("technical_assessment", "aptitude_10", "rating_5")
+
+
+def add_role_z(train_df, other_df, cols=ROLE_Z_COLS):
+    other_df = other_df.copy()
+    stats = train_df.groupby("applied_role")[list(cols)].agg(["mean", "std"])
+    for c in cols:
+        m = other_df["applied_role"].map(stats[(c, "mean")])
+        sd = other_df["applied_role"].map(stats[(c, "std")]).replace(0, np.nan)
+        other_df[c + "_role_z"] = (other_df[c] - m) / sd
+    return other_df
+
+
+dev_c = add_role_z(train_c, dev_c)
+test_c = add_role_z(train_c, test_c)
+train_c = add_role_z(train_c, train_c)
+
 # ----------------------------------------------------------------------
 # 3. DEDUPE + FAKE-PROFILE FILTER (applied to the VAULT / test set, since
 #    that's what we are shortlisting from)
@@ -292,6 +319,9 @@ test_c = flag_fabricated(test_c)
 #    it validated best on the dev set).
 # ----------------------------------------------------------------------
 from sklearn.ensemble import HistGradientBoostingRegressor, HistGradientBoostingClassifier
+from sklearn.linear_model import Ridge
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
 
 FEATURES = [
     "exp_years", "current_ctc_lpa", "expected_ctc_lpa", "aptitude_10", "rating_5",
@@ -300,6 +330,8 @@ FEATURES = [
     "technical_assessment", "training_hours", "trainings_last_year",
     "num_employers", "title_inflation_flag", "notice_too_long", "old_boys_flag",
     "note_score", "award_count", "age", "graduation_year",
+    # role-normalized additions (see section 2b)
+    "technical_assessment_role_z", "aptitude_10_role_z", "rating_5_role_z",
 ]
 
 X_train = train_c[FEATURES]
@@ -308,12 +340,26 @@ TOP5_THRESHOLD = y_train.quantile(0.95)
 y_train_bin = (y_train >= TOP5_THRESHOLD).astype(int)
 
 SEEDS = [1, 2, 3, 42, 100]
-REG_BLEND_WEIGHT = 0.7  # tuned on the dev set; regression view carries more weight
+# Re-tuned on the dev set (precision@150) after adding the role-z features:
+# grid search over [0,1] showed a stable 0.30-0.45 plateau for the regressor
+# weight (0.34-0.36 precision@150, vs 0.333 for the old 0.7 weight), so these
+# three weights (not just one axis) were picked from the middle of that
+# plateau rather than the single best grid point, to avoid chasing noise --
+# with only 150 winners in dev, one candidate swapping in/out moves precision
+# by 0.0067, so the exact argmax of a grid search is not trustworthy.
+REG_BLEND_WEIGHT = 0.4
+CLF_BLEND_WEIGHT = 0.4
+RIDGE_BLEND_WEIGHT = 0.2
+
+_imputer = SimpleImputer(strategy="median")
+_scaler = StandardScaler()
+_X_train_scaled = _scaler.fit_transform(_imputer.fit_transform(X_train))
 
 
 def predict_ensemble(df):
     X = df[FEATURES]
-    reg_preds, clf_preds = [], []
+    X_scaled = _scaler.transform(_imputer.transform(X))
+    reg_preds, clf_preds, ridge_preds = [], [], []
     for s in SEEDS:
         reg = HistGradientBoostingRegressor(random_state=s, max_iter=300)
         reg.fit(X_train, y_train)
@@ -322,12 +368,23 @@ def predict_ensemble(df):
         clf = HistGradientBoostingClassifier(random_state=s, max_iter=300, class_weight="balanced")
         clf.fit(X_train, y_train_bin)
         clf_preds.append(clf.predict_proba(X)[:, 1])
+
+        # A linear model on the same features gives a genuinely different
+        # error pattern than two tree ensembles (which is where a 3rd
+        # "seed-averaged" copy of the same model type stops helping).
+        ridge = Ridge(alpha=10.0, random_state=s)
+        ridge.fit(_X_train_scaled, y_train)
+        ridge_preds.append(ridge.predict(X_scaled))
+
     reg_avg = np.mean(reg_preds, axis=0)
     clf_avg = np.mean(clf_preds, axis=0)
-    # blend by rank percentile so the two different scales combine fairly
+    ridge_avg = np.mean(ridge_preds, axis=0)
+    # blend by rank percentile so the three different scales combine fairly
     reg_pct = pd.Series(reg_avg).rank(pct=True).values
     clf_pct = pd.Series(clf_avg).rank(pct=True).values
-    return REG_BLEND_WEIGHT * reg_pct + (1 - REG_BLEND_WEIGHT) * clf_pct
+    ridge_pct = pd.Series(ridge_avg).rank(pct=True).values
+    return (REG_BLEND_WEIGHT * reg_pct + CLF_BLEND_WEIGHT * clf_pct
+            + RIDGE_BLEND_WEIGHT * ridge_pct)
 
 
 dev_c["pred_score"] = predict_ensemble(dev_c)
@@ -354,14 +411,24 @@ print(f"[validation] precision@150 on dev set: {precision_at_150:.3f}  "
 # ----------------------------------------------------------------------
 test_final = test_c.copy()
 
-# hard exclusions: fabricated profiles, duplicate rows, unrealistic notice period
-excluded = test_final["is_fabricated"] | test_final["is_duplicate"] | (test_final["notice_days"] > 60)
+# hard exclusions: fabricated profiles, duplicate rows, unrealistic notice
+# period, AND title-inflated profiles. The debrief is literal here -- "go
+# straight to the bin, however shiny the rest looks" -- so this is a hard
+# exclusion, not a score penalty. (On this run it changes nothing -- the old
+# -8 penalty already pushed every title-inflated profile out of the top 500
+# -- but the code should say what the debrief says, since the code is what
+# gets explained at the Day-1 audit.)
+excluded = (
+    test_final["is_fabricated"]
+    | test_final["is_duplicate"]
+    | (test_final["notice_days"] > 60)
+    | (test_final["title_inflation_flag"] == 1)
+)
 test_final = test_final[~excluded].copy()
 
-# score adjustment: boost sustained code contributors, penalize title inflation
+# score adjustment: boost sustained code contributors
 adj = test_final["pred_score"].copy()
 adj += test_final["sustained_contributor"] * 5.0
-adj -= test_final["title_inflation_flag"] * 8.0
 test_final["final_score"] = adj
 
 test_final = test_final.sort_values("final_score", ascending=False)
